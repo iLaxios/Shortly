@@ -3,8 +3,10 @@ package com.laxios.shortener.service;
 import com.laxios.commons.events.UrlCreatedEvent;
 import com.laxios.shortener.entity.UrlMapping;
 import com.laxios.shortener.repository.UrlMappingRepository;
+import com.laxios.shortener.telemetry.TelemetryService;
 import com.laxios.shortener.util.JwtUtil;
 import lombok.Data;
+import lombok.RequiredArgsConstructor;
 import org.apache.commons.validator.routines.UrlValidator;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -18,28 +20,29 @@ import java.util.concurrent.ThreadLocalRandom;
 
 @Data
 @Service
+@RequiredArgsConstructor
 public class ShortenerService {
 
     private final UrlMappingRepository urlMappingRepository;
     private final RedisTemplate<String, Object> redisTemplate;
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final TelemetryService telemetryService;
 
-
-    // In-memory store for now (later replace with Postgres/Redis)
-    private final Map<String, String> urlStore = new HashMap<>();
 
     private static final String ALLOWED_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final int SHORT_CODE_LENGTH = 6;
 
     public String shortenURL(String inputUrl, String jwt) {
+        long start = System.currentTimeMillis();
 
         // Validate url
         UrlValidator validator = new UrlValidator(
-            new String[]{"http", "https"},
-            UrlValidator.ALLOW_LOCAL_URLS // remember to remove this
+                new String[]{"http", "https"},
+                UrlValidator.ALLOW_LOCAL_URLS
         );
 
         if (!validator.isValid(inputUrl)) {
+            telemetryService.incrementValidationFailed();
             throw new IllegalArgumentException("Invalid URL format");
         }
 
@@ -55,6 +58,7 @@ public class ShortenerService {
         // If URL already shortened, return existing code from DB if not in cache
         Optional<UrlMapping> existing = urlMappingRepository.findByOriginalUrlAndCreatedByUser(inputUrl, createdByUser);
         if (existing.isPresent()) {
+            telemetryService.recordLatency(System.currentTimeMillis() - start);
             return existing.get().getShortCode();
         }
 
@@ -73,14 +77,14 @@ public class ShortenerService {
         // Save to Redis
         redisTemplate.opsForValue().set(shortCode, mapping);
 
-        // emit event to kafka for url creation for initiating analytics
-        UrlCreatedEvent event = new UrlCreatedEvent(
+        kafkaTemplate.send("url-created", new UrlCreatedEvent(
                 mapping.getShortCode(),
                 mapping.getCreatedByUser(),
                 mapping.getCreatedAt()
-        );
+        ));
 
-        kafkaTemplate.send("url-created", event);
+        telemetryService.incrementUrlCreated(createdByUser);
+        telemetryService.recordLatency(System.currentTimeMillis() - start);
 
         return "http://cur.ly/" + shortCode;
     }
